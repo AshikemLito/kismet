@@ -66,7 +66,7 @@ const mapTournamentFromDb = (tournamentRow: TournamentRow): Tournament => ({
     classes: parseJsonField(tournamentRow.classes, []),
     byeAssignmentMethod: tournamentRow.bye_assignment_method || undefined,
     byeSpread: tournamentRow.bye_spread ?? 50,
-    scoring: parseJsonField(tournamentRow.scoring, null),
+    scoring: parseJsonField(tournamentRow.scoring, { win: 1, draw: 0.5, loss: 0 }),
     ratingsSystemSettings: parseJsonField(tournamentRow.ratings_system_settings, null),
     postTournamentRatings: parseJsonField(tournamentRow.post_tournament_ratings, null),
     gibsonRounds: tournamentRow.gibson_rounds || undefined,
@@ -312,6 +312,7 @@ export const createTournament = async (name: string, tournamentMode: TournamentM
         team_settings: JSON.stringify({ topPlayersCount: 4, displayTeamNames: false, preventTeammatePairings_AllRounds: false, preventTeammatePairings_InitialRounds: 0 }),
         public_portal_settings: JSON.stringify({ bannerUrl: '', welcomeMessage: '' }),
         tie_break_order: ['cumulativeSpread', 'buchholz', 'rating'], bye_spread: 50,
+        scoring: JSON.stringify({ win: 1, draw: 0.5, loss: 0 }),
     };
     const { data, error } = await supabase.from('tournaments').insert(newTournamentData).select().single();
     if (error) { console.error("Error creating tournament:", error); throw error; }
@@ -733,6 +734,7 @@ export const submitScores = async (tournamentId: string, scores: Record<number, 
         const pendingInRound = matches.some(m => m.round === completedRound && m.status === 'pending');
         if (pendingInRound) return; 
         
+        // FIX: Swapped arguments to match the function signature `saveStandingsSnapshot(tournamentId, round)`.
         await saveStandingsSnapshot(tournamentId, completedRound);
         
         console.log(`Round ${completedRound} is complete. Running automated pairing engine.`);
@@ -910,6 +912,57 @@ const _pairAustralianDraw = async (tournamentId: string, roundToPair: number, pl
     return matchesToInsert;
 };
 
+const _pairChew = async (
+    tournamentId: string, 
+    roundToPair: number, 
+    playersToPair: Player[], 
+    standings: Standing[], 
+    rule: PairingRule
+): Promise<TablesInsert<'matches'>[]> => {
+    const tournament = await getTournament(tournamentId);
+    if (!tournament) return [];
+
+    const roundsRemaining = tournament.totalRounds - (roundToPair - 1);
+    const winScore = tournament.scoring?.win ?? 1;
+    const maxPossibleScoreIncrease = roundsRemaining * winScore;
+    
+    const divisionStandings = standings.filter(s => playersToPair.some(p => p.id === s.player.id));
+    const leaderScore = divisionStandings.length > 0 ? divisionStandings[0].score : 0;
+    
+    const playerStandings = new Map(divisionStandings.map(s => [s.player.id, s]));
+
+    const contenders: Player[] = [];
+    const nonContenders: Player[] = [];
+
+    for (const player of playersToPair) {
+        const standing = playerStandings.get(player.id);
+        const playerScore = standing?.score ?? 0;
+        if (playerScore + maxPossibleScoreIncrease >= leaderScore) {
+            contenders.push(player);
+        } else {
+            nonContenders.push(player);
+        }
+    }
+    
+    // Sort contenders by rank to determine who to float down
+    contenders.sort((a,b) => {
+        const rankA = playerStandings.get(a.id)?.rank ?? 999;
+        const rankB = playerStandings.get(b.id)?.rank ?? 999;
+        return rankA - rankB;
+    });
+
+    // If contenders are an odd number, move the lowest ranked contender to non-contenders
+    if (contenders.length % 2 !== 0 && contenders.length > 1) {
+        const floater = contenders.pop()!;
+        nonContenders.push(floater);
+    }
+
+    const contenderMatches = await _pairKoth(tournamentId, roundToPair, contenders, standings);
+    const nonContenderMatches = await _pairSwiss(tournamentId, roundToPair, nonContenders, standings, rule);
+    
+    return [...contenderMatches, ...nonContenderMatches];
+};
+
 
 export const generatePairingForRound = async (tournamentId: string, rule: PairingRule, roundToPair: number): Promise<Match[]> => {
     const tournament = await getTournament(tournamentId);
@@ -947,6 +1000,9 @@ export const generatePairingForRound = async (tournamentId: string, rule: Pairin
 
         let divisionMatches: TablesInsert<'matches'>[] = [];
         switch (rule.pairingMethod) {
+            case 'Chew Pairings':
+                divisionMatches = await _pairChew(tournamentId, roundToPair, divisionPlayers, standings, rule);
+                break;
             case 'Swiss':
                 divisionMatches = await _pairSwiss(tournamentId, roundToPair, divisionPlayers, standings, rule);
                 break;
